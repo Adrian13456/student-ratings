@@ -10,7 +10,36 @@ const port = process.env.API_PORT || 4000;
 const mongoUri = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/student_ratings';
 const tokenSecret = process.env.AUTH_SECRET || 'student-ratings-development-secret';
 
-app.use(cors({ origin: process.env.FRONTEND_URL || 'http://localhost:3000' }));
+app.use((req, res, next) => {
+  const requestId = crypto.randomUUID();
+  const started = process.hrtime.bigint();
+  res.setHeader('X-Request-Id', requestId);
+
+  function logRequest(aborted) {
+    const status = aborted && !res.headersSent ? null : res.statusCode;
+    const level = status >= 500 ? 'error' : aborted || status >= 400 ? 'warn' : 'info';
+    const route = req.route?.path ?? (req.method === 'OPTIONS' ? '(preflight)' : '(unmatched)');
+    const entry = {
+      timestamp: new Date().toISOString(),
+      level,
+      event: aborted ? 'http.request.aborted' : 'http.request.completed',
+      requestId,
+      method: req.method,
+      route,
+      status,
+      durationMs: Number((Number(process.hrtime.bigint() - started) / 1e6).toFixed(2)),
+    };
+    console[level](JSON.stringify(entry));
+  }
+
+  res.once('finish', () => logRequest(false));
+  res.once('close', () => { if (!res.writableFinished) logRequest(true); });
+  next();
+});
+app.use(cors({
+  origin: process.env.FRONTEND_URL || 'http://localhost:3000',
+  exposedHeaders: ['X-Request-Id'],
+}));
 app.use(express.json());
 
 const scoreSchema = new mongoose.Schema({ subject: { type: String, required: true }, value: { type: Number, min: 0, max: 100, required: true }, semester: { type: String, required: true } }, { _id: false });
@@ -49,11 +78,19 @@ function normalizeStudentInput(body) { const name = body.fullName || `${body.fir
 function toStudentPayload(student, grades) { const scores = grades.map((grade) => ({ subject: grade.subject, value: grade.value, semester: grade.semester })); const values = scores.map((score) => score.value); const rating = values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : Number(student.rating || 0); return { ...student, id: student._id, scores, grades, rating: Number(rating.toFixed(1)), average: Number(rating.toFixed(1)), gradesCount: grades.length }; }
 function publicUser(user) { return { id: user._id, email: user.email, role: user.role, displayName: user.displayName }; }
 
+function sendWriteError(res, error, message) {
+  if (error.code === 11000) return res.status(409).json({ message: 'Студент із таким email уже існує' });
+  if (error.name === 'ValidationError' || error.name === 'CastError') {
+    return res.status(400).json({ message: `${message}. Перевірте введені дані.` });
+  }
+  return res.status(500).json({ message });
+}
+
 app.get('/api/health', (_req, res) => res.json({ status: 'ok', service: 'student-ratings-api' }));
 
 app.post('/api/auth/login', async (req, res) => {
   try { const user = await User.findOne({ email: req.body?.email?.toLowerCase() }); if (!user || !verifyPassword(req.body?.password || '', user.passwordHash)) return res.status(401).json({ message: 'Невірний email або пароль' }); res.json({ token: signToken(user), user: publicUser(user) }); }
-  catch (error) { res.status(500).json({ message: 'Не вдалося виконати вхід', error: error.message }); }
+  catch { res.status(500).json({ message: 'Не вдалося виконати вхід' }); }
 });
 app.get('/api/auth/me', requireAuth, async (req, res) => { const user = await User.findById(req.user.sub); if (!user) return res.status(401).json({ message: 'Користувача не знайдено' }); res.json({ user: publicUser(user) }); });
 
@@ -66,16 +103,25 @@ app.get('/api/students', async (req, res) => {
     let result = allStudents.map((student) => toStudentPayload(student, byStudent[student._id.toString()] || [])); const direction = req.query.order === 'asc' ? 1 : -1;
     if (req.query.sort === 'name') result.sort((a, b) => a.fullName.localeCompare(b.fullName) * direction); else result.sort((a, b) => (a.rating - b.rating) * direction);
     const total = result.length; result = result.slice((page - 1) * limit, page * limit); res.json({ data: result, pagination: { page, limit, total, pages: Math.ceil(total / limit) } });
-  } catch (error) { res.status(500).json({ message: 'Не вдалося отримати список студентів', error: error.message }); }
+  } catch { res.status(500).json({ message: 'Не вдалося отримати список студентів' }); }
 });
 
-app.get('/api/students/:id', async (req, res) => { try { if (!validId(req.params.id)) return res.status(400).json({ message: 'Некоректний id студента' }); const student = await Student.findById(req.params.id).lean(); if (!student) return res.status(404).json({ message: 'Студента не знайдено' }); const grades = await Grade.find({ student: student._id }).sort({ semester: -1, subject: 1 }).lean(); res.json(toStudentPayload(student, grades)); } catch (error) { res.status(500).json({ message: 'Не вдалося отримати профіль студента', error: error.message }); } });
-app.post('/api/students', requireAuth, requireAdmin, async (req, res) => { try { const student = await Student.create(normalizeStudentInput(req.body)); res.status(201).json(toStudentPayload(student.toObject(), [])); } catch (error) { res.status(400).json({ message: 'Не вдалося створити студента', error: error.message }); } });
-app.put('/api/students/:id', requireAuth, requireAdmin, async (req, res) => { try { if (!validId(req.params.id)) return res.status(400).json({ message: 'Некоректний id студента' }); const grades = req.body.grades || req.body.scores; const studentData = normalizeStudentInput(req.body); ['grades', 'scores', '_id', 'id', 'createdAt', 'updatedAt', 'average', 'rating', 'gradesCount'].forEach((field) => delete studentData[field]); const student = await Student.findByIdAndUpdate(req.params.id, studentData, { new: true, runValidators: true }).lean(); if (!student) return res.status(404).json({ message: 'Студента не знайдено' }); if (Array.isArray(grades)) { await Grade.deleteMany({ student: student._id }); await Grade.insertMany(grades.map((grade) => ({ subject: grade.subject, value: grade.value, semester: grade.semester || student.semester, student: student._id, recordedBy: req.user.email }))); } const savedGrades = await Grade.find({ student: student._id }).lean(); const rating = savedGrades.length ? savedGrades.reduce((sum, grade) => sum + grade.value, 0) / savedGrades.length : 0; await Student.findByIdAndUpdate(student._id, { rating: Number(rating.toFixed(1)), scores: savedGrades.map((grade) => ({ subject: grade.subject, value: grade.value, semester: grade.semester })) }); res.json(toStudentPayload({ ...student, rating }, savedGrades)); } catch (error) { res.status(400).json({ message: 'Не вдалося оновити студента', error: error.message }); } });
-app.delete('/api/students/:id', requireAuth, requireAdmin, async (req, res) => { try { if (!validId(req.params.id)) return res.status(400).json({ message: 'Некоректний id студента' }); const student = await Student.findByIdAndDelete(req.params.id); if (!student) return res.status(404).json({ message: 'Студента не знайдено' }); await Grade.deleteMany({ student: student._id }); res.status(204).send(); } catch (error) { res.status(500).json({ message: 'Не вдалося видалити студента', error: error.message }); } });
-app.post('/api/grades', requireAuth, requireAdmin, async (req, res) => { try { const grade = await Grade.create({ ...req.body, recordedBy: req.user.email }); res.status(201).json(grade); } catch (error) { res.status(400).json({ message: 'Не вдалося зберегти оцінку', error: error.message }); } });
-app.get('/api/rankings', async (req, res) => { try { const semester = req.query.semester || 'Осінь 2026'; const rows = await Grade.aggregate([{ $match: { semester } }, { $group: { _id: '$student', average: { $avg: '$value' }, gradesCount: { $sum: 1 } } }, { $sort: { average: -1 } }, { $lookup: { from: 'students', localField: '_id', foreignField: '_id', as: 'student' } }, { $unwind: '$student' }, { $project: { _id: 0, student: '$student', average: { $round: ['$average', 1] }, gradesCount: 1 } }]); res.json(rows.map((row, index) => ({ rank: index + 1, ...row }))); } catch (error) { res.status(500).json({ message: 'Не вдалося сформувати рейтинг', error: error.message }); } });
+app.get('/api/students/:id', async (req, res) => { try { if (!validId(req.params.id)) return res.status(400).json({ message: 'Некоректний id студента' }); const student = await Student.findById(req.params.id).lean(); if (!student) return res.status(404).json({ message: 'Студента не знайдено' }); const grades = await Grade.find({ student: student._id }).sort({ semester: -1, subject: 1 }).lean(); res.json(toStudentPayload(student, grades)); } catch { res.status(500).json({ message: 'Не вдалося отримати профіль студента' }); } });
+app.post('/api/students', requireAuth, requireAdmin, async (req, res) => { try { const student = await Student.create(normalizeStudentInput(req.body)); res.status(201).json(toStudentPayload(student.toObject(), [])); } catch (error) { sendWriteError(res, error, 'Не вдалося створити студента'); } });
+app.put('/api/students/:id', requireAuth, requireAdmin, async (req, res) => { try { if (!validId(req.params.id)) return res.status(400).json({ message: 'Некоректний id студента' }); const grades = req.body.grades || req.body.scores; const studentData = normalizeStudentInput(req.body); ['grades', 'scores', '_id', 'id', 'createdAt', 'updatedAt', 'average', 'rating', 'gradesCount'].forEach((field) => delete studentData[field]); const student = await Student.findByIdAndUpdate(req.params.id, studentData, { new: true, runValidators: true }).lean(); if (!student) return res.status(404).json({ message: 'Студента не знайдено' }); if (Array.isArray(grades)) { await Grade.deleteMany({ student: student._id }); await Grade.insertMany(grades.map((grade) => ({ subject: grade.subject, value: grade.value, semester: grade.semester || student.semester, student: student._id, recordedBy: req.user.email }))); } const savedGrades = await Grade.find({ student: student._id }).lean(); const rating = savedGrades.length ? savedGrades.reduce((sum, grade) => sum + grade.value, 0) / savedGrades.length : Array.isArray(grades) ? 0 : Number(req.body.rating ?? student.rating ?? 0); await Student.findByIdAndUpdate(student._id, { rating: Number(rating.toFixed(1)), scores: savedGrades.map((grade) => ({ subject: grade.subject, value: grade.value, semester: grade.semester })) }); res.json(toStudentPayload({ ...student, rating }, savedGrades)); } catch (error) { sendWriteError(res, error, 'Не вдалося оновити студента'); } });
+app.delete('/api/students/:id', requireAuth, requireAdmin, async (req, res) => { try { if (!validId(req.params.id)) return res.status(400).json({ message: 'Некоректний id студента' }); const student = await Student.findByIdAndDelete(req.params.id); if (!student) return res.status(404).json({ message: 'Студента не знайдено' }); await Grade.deleteMany({ student: student._id }); res.status(204).send(); } catch { res.status(500).json({ message: 'Не вдалося видалити студента' }); } });
+app.post('/api/grades', requireAuth, requireAdmin, async (req, res) => { try { const grade = await Grade.create({ ...req.body, recordedBy: req.user.email }); res.status(201).json(grade); } catch (error) { sendWriteError(res, error, 'Не вдалося зберегти оцінку'); } });
+app.get('/api/rankings', async (req, res) => { try { const semester = req.query.semester || 'Осінь 2026'; const rows = await Grade.aggregate([{ $match: { semester } }, { $group: { _id: '$student', average: { $avg: '$value' }, gradesCount: { $sum: 1 } } }, { $sort: { average: -1 } }, { $lookup: { from: 'students', localField: '_id', foreignField: '_id', as: 'student' } }, { $unwind: '$student' }, { $project: { _id: 0, student: '$student', average: { $round: ['$average', 1] }, gradesCount: 1 } }]); res.json(rows.map((row, index) => ({ rank: index + 1, ...row }))); } catch { res.status(500).json({ message: 'Не вдалося сформувати рейтинг' }); } });
 
-async function start() { try { await mongoose.connect(mongoUri); console.log(`MongoDB connected: ${mongoUri}`); app.listen(port, () => console.log(`API running at http://localhost:${port}`)); } catch (error) { console.error('MongoDB connection failed:', error.message); process.exit(1); } }
+app.use((_req, res) => res.status(404).json({ message: 'Маршрут API не знайдено' }));
+app.use((error, _req, res, next) => {
+  if (res.headersSent) return next(error);
+  if (error.type === 'entity.parse.failed') return res.status(400).json({ message: 'Некоректний JSON у запиті' });
+  if (error.status === 415) return res.status(415).json({ message: 'Непідтримуваний формат запиту' });
+  if (error.type === 'entity.too.large') return res.status(413).json({ message: 'Запит перевищує допустимий розмір' });
+  return res.status(500).json({ message: 'Внутрішня помилка сервера' });
+});
+
+async function start() { try { await mongoose.connect(mongoUri); console.log('MongoDB connected'); app.listen(port, () => console.log(`API running at http://localhost:${port}`)); } catch (error) { console.error('MongoDB connection failed:', error.message); process.exit(1); } }
 if (require.main === module) start();
 module.exports = { app, Student, Grade, User, hashPassword };

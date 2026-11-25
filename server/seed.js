@@ -4,11 +4,11 @@ require('dotenv').config();
 const { Student, Grade, User, hashPassword } = require('./index');
 
 const students = [
-  ['Анна Коваленко', 'anna.kovalenko@example.com', 'КН-31', 3, 96.4, '#f26a4f'],
-  ['Марія Бондар', 'maria.bondar@example.com', 'КН-32', 3, 94.8, '#e7a93b'],
-  ['Олексій Шевченко', 'oleksii.shevchenko@example.com', 'КН-31', 3, 93.7, '#4d8f86'],
-  ['Ірина Мельник', 'iryna.melnyk@example.com', 'КН-33', 3, 91.2, '#8b79b8'],
-  ['Дмитро Ткаченко', 'dmytro.tkachenko@example.com', 'КН-32', 3, 89.6, '#6c9bbd'],
+  ['Анна Коваленко', 'anna.kovalenko@example.com', 'Феі-41', 3, 96.4, '#f26a4f'],
+  ['Марія Бондар', 'maria.bondar@example.com', 'Феі-42', 3, 94.8, '#e7a93b'],
+  ['Олексій Шевченко', 'oleksii.shevchenko@example.com', 'Феі-41', 3, 93.7, '#4d8f86'],
+  ['Ірина Мельник', 'iryna.melnyk@example.com', 'ФЕІ-43', 3, 91.2, '#8b79b8'],
+  ['Дмитро Ткаченко', 'dmytro.tkachenko@example.com', 'Феі-42', 3, 89.6, '#6c9bbd'],
 ];
 
 async function seed() {
